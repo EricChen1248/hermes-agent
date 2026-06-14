@@ -2592,6 +2592,27 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
 
+ALLOWED_TOOLS_FILE_PATH = '/opt/data/allowed_tools.json'
+def check_tool(server_name: str, tool_name: str):
+    if not os.path.exists(ALLOWED_TOOLS_FILE_PATH):
+        with open(ALLOWED_TOOLS_FILE_PATH, 'w') as f:
+            json.dump({}, f)
+    
+    with open(ALLOWED_TOOLS_FILE_PATH, 'r') as f:
+        allowed_tools = json.load(f)
+    
+    return tool_name in allowed_tools.get(server_name, [])
+
+def permanent_approve_tool(server_name: str, tool_name: str):
+    with open(ALLOWED_TOOLS_FILE_PATH, 'r') as f:
+        allowed_tools = json.load(f)
+
+    server_tool = allowed_tools.get(server_name, [])
+    server_tool.append(tool_name)
+    allowed_tools[server_name] = list(set(server_tool))
+    with open(ALLOWED_TOOLS_FILE_PATH, 'w+') as f:
+        json.dump(allowed_tools, f)
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -2635,6 +2656,55 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             }, ensure_ascii=False)
 
         async def _call():
+            approved_tool = check_tool(server_name, tool_name)
+            if not approved_tool:
+                from tools.approval import get_current_session_key, _gateway_notify_cbs, _await_gateway_decision
+                session_key = get_current_session_key()
+                notify_cb = None
+                with _lock:
+                    notify_cb = _gateway_notify_cbs.get(session_key)
+
+                if notify_cb is not None:
+                    # --- Blocking gateway approval (queue-based) ---
+                    # Block the agent thread until the user responds; the notify +
+                    # heartbeat wait loop is shared with check_execute_code_guard via
+                    # _await_gateway_decision().
+                    approval_data = {
+                        "command": f"{server_name} {tool_name} {args}",
+                        "pattern_key": "",
+                        "pattern_keys": "",
+                        "description": f"Using tool MCP tool {server_name} {tool_name}",
+                    }
+                    decision = _await_gateway_decision(
+                        session_key, notify_cb, approval_data, surface="gateway"
+                    )
+
+                    if decision.get("notify_failed"):
+                        return {
+                            "approved": False,
+                            "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
+                            "pattern_key": "",
+                            "description": f"Using tool MCP tool {server_name} {tool_name}",
+                        }
+                    resolved = decision["resolved"]
+                    choice = decision["choice"]
+                    
+                    if not resolved or choice is None or choice == "deny":
+                        # Consent contract: silence is NOT consent, and an explicit
+                        # deny is also a hard halt — both produce a BLOCKED outcome
+                        # that names the agent's most common evasion paths (retry,
+                        # rephrase, achieve the same outcome via a different command).
+                        # See issue #24912 for the original incident.
+                        return json.dumps({
+                            "error": _sanitize_error(
+                                "User has not approved the tool use."
+                            )
+                        }, ensure_ascii=False)
+                    
+                    if choice == "always":
+                        permanent_approve_tool(server_name, tool_name)
+                            
+
             async with server._rpc_lock:
                 result = await server.session.call_tool(tool_name, arguments=args)
             # MCP CallToolResult has .content (list of content blocks) and .isError
